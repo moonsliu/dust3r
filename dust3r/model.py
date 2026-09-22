@@ -11,6 +11,7 @@ from packaging import version
 import huggingface_hub
 
 from .utils.misc import fill_default_args, freeze_all_params, is_symmetrized, interleave, transpose_to_landscape
+from .human_aware_attention import masked_cross_attention, temporal_background_masks
 from .heads import head_factory
 from dust3r.patch_embed import get_patch_embed
 
@@ -169,24 +170,41 @@ class AsymmetricCroCo3DStereo (
 
         return (shape1, shape2), (feat1, feat2), (pos1, pos2)
 
-    def _decoder(self, f1, pos1, f2, pos2):
-        final_output = [(f1, f2)]  # before projection
+    def _decoder(self, f1, pos1, f2, pos2, temporal_masks=None):
+        final_output = [(f1, f2)]
 
-        # project to decoder dim
         f1 = self.decoder_embed(f1)
         f2 = self.decoder_embed(f2)
-
         final_output.append((f1, f2))
+
         for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
-            # img1 side
-            f1, _ = blk1(*final_output[-1][::+1], pos1, pos2)
-            # img2 side
-            f2, _ = blk2(*final_output[-1][::-1], pos2, pos1)
-            # store the result
+            if temporal_masks is None:
+                f1, _ = blk1(*final_output[-1][::+1], pos1, pos2)
+                f2, _ = blk2(*final_output[-1][::-1], pos2, pos1)
+            else:
+                keep1, keep2 = temporal_masks
+                x1, y1 = final_output[-1][::+1]
+                x1 = x1 + blk1.drop_path(blk1.attn(blk1.norm1(x1), pos1))
+                y1 = blk1.norm_y(y1)
+                cross1 = masked_cross_attention(
+                    blk1.cross_attn, blk1.norm2(x1), y1, y1,
+                    pos1, pos2, keep1, keep2,
+                )
+                f1 = x1 + blk1.drop_path(cross1)
+                f1 = f1 + blk1.drop_path(blk1.mlp(blk1.norm3(f1)))
+
+                x2, y2 = final_output[-1][::-1]
+                x2 = x2 + blk2.drop_path(blk2.attn(blk2.norm1(x2), pos2))
+                y2 = blk2.norm_y(y2)
+                cross2 = masked_cross_attention(
+                    blk2.cross_attn, blk2.norm2(x2), y2, y2,
+                    pos2, pos1, keep2, keep1,
+                )
+                f2 = x2 + blk2.drop_path(cross2)
+                f2 = f2 + blk2.drop_path(blk2.mlp(blk2.norm3(f2)))
             final_output.append((f1, f2))
 
-        # normalize last output
-        del final_output[1]  # duplicate with final_output[0]
+        del final_output[1]
         final_output[-1] = tuple(map(self.dec_norm, final_output[-1]))
         return zip(*final_output)
 
@@ -200,8 +218,17 @@ class AsymmetricCroCo3DStereo (
         # encode the two images --> B,S,D
         (shape1, shape2), (feat1, feat2), (pos1, pos2) = self._encode_symmetrized(view1, view2)
 
+        temporal_masks = temporal_background_masks(
+            view1,
+            view2,
+            self.patch_embed.patch_size,
+            feat1.shape[1],
+            feat2.shape[1],
+            feat1.device,
+        )
+
         # combine all ref images into object-centric representation
-        dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2)
+        dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2, temporal_masks)
 
         with torch.cuda.amp.autocast(enabled=False):
             res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
